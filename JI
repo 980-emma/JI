@@ -1,0 +1,199 @@
+from fipy import Variable, FaceVariable, CellVariable, Grid1D, ExplicitDiffusionTerm, TransientTerm, DiffusionTerm, Viewer, Constraint, solvers
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import *
+import scipy.optimize as opt
+import scipy.stats as stats
+import ipywidgets as widgets
+import pandas as pd
+import time
+import netCDF4 as nc
+from colour import Color
+
+# create solver object which will be called by the .solve() method in FiPy
+# scipy's LinearLUSolver which solves linear systems of equations via LU-factorization.
+solver = solvers.LinearLUSolver()
+
+# Archimedes' parameter
+rho = 0.91
+rho_w = 1.
+c = (rho_w-rho)/rho
+
+# JAKOBSHAVN ISBRAE DATA
+
+# raw
+jakobshavn = nc.Dataset('Jakobshavn Data/merged.nc','r')
+
+# filter
+ice_x = jakobshavn.variables['x'][:] # all x-coordinates available
+ice_y = jakobshavn.variables['y'][:] # all y-coordinates available
+ice_t = np.array(jakobshavn.variables['time'][:]) # all times available 
+ice_z = np.array(jakobshavn.variables['z'][:]) # surface elevation for all x, y, t
+
+# BEDROCK DATA
+
+# raw
+bedrock = nc.Dataset('Jakobshavn Data/BedMachineGreenland-v5.nc', 'r')
+
+# filter
+bed_x = bedrock.variables['x'][:] # all x-coordinates available
+bed_y = bedrock.variables['y'][:] # all y-coordinates available
+bed_b = np.array(bedrock.variables['bed'][:]) # bedrock for all x, y
+
+# PRECIPITATION DATA
+precipitation = np.array(pd.read_csv('Jakobshavn Data/precipitation.csv', sep=',')['mean (mm)']) # m per year
+
+# LINE PROFILE DATA (NB "profile" refers to sampling data points in space, "sample" refers to sampling data points in time)
+
+# raw
+raw_profile = pd.read_csv('Jakobshavn Data/profile.txt', sep=' ', skiprows=6)
+
+# filter
+xs0 = np.array(raw_profile['Unnamed: 1']) # x-coordinates of original profile
+ys0 = np.array(raw_profile['Unnamed: 2']) # y-coordinates of original profile
+ds0 = np.concatenate((np.array(raw_profile['y'].dropna()), np.array(raw_profile['Unnamed: 6'].dropna()))) # distance along original profile
+cutoff1 = np.argmin(ds0<6000) # start 6km along line profile shown in fig 1 of Joughin et al. 2020
+cutoff2 = np.argmin(ds0<17000) # end 17km along line profile shown in fig 1 of Joughin et al. 2020
+
+# crop profile
+xs_cropped = xs0[cutoff1:cutoff2] # x-coordinates of cropped profile
+ys_cropped = ys0[cutoff1:cutoff2] # y-coordinates of cropped profile
+ds_cropped = ds0[cutoff1:cutoff2] # distance along cropped profile
+
+# TAKE JAKOBSHAVN ISBRAE DATA AT PROFILE POINTS
+
+# find indices of profile points i.e. where all_x-x and all_y-y is smallest
+ice_x_profile = [np.argmin(np.abs(ice_x - x)) for x in xs_cropped]
+ice_y_profile = [np.argmin(np.abs(ice_y - y)) for y in ys_cropped]
+
+# sample elevation data
+zts = []
+for t in range(len(ice_z)):
+    zt_sample = []
+    for x,y in zip(ice_x_profile, ice_y_profile):
+        zt_sample.append(ice_z[t][y][x]) # at each time step, take values of z(t) at each sample point and add to sample list
+    zts.append(zt_sample) # add sample list to sample list for all times
+
+# TAKE BEDROCK DATA AT PROFILE POINTS
+
+# find indices of profile points i.e. where all_x-x and all_y-y is smallest
+bed_x_profile = [np.argmin(np.abs(bed_x - x)) for x in xs_cropped]
+bed_y_profile = [np.argmin(np.abs(bed_y - y)) for y in ys_cropped]
+
+# sample bedrock data
+bs = []
+for x,y in zip(bed_x_profile, bed_y_profile):
+    bs.append(bed_b[y][x]) # at each time step, take values of z(t) at each sample point and add to sample list
+
+# PLOT ORIGINAL PROFILE, CROPPED PROFILE AND DATA POINTS
+    
+plt.figure()
+plt.plot(xs0/1e3, ys0/1e6, label='original profile')
+plt.plot(xs_cropped/1e3, ys_cropped/1e6, label='cropped profile')
+plt.plot(ice_x[ice_x_profile]/1e3, ice_y[ice_y_profile]/1e6, label='elevation sample points')
+plt.plot(bed_x[bed_x_profile]/1e3, bed_y[bed_y_profile]/1e6, label='bedrock sample points')
+plt.xlabel('projected x-coordinate (km)')
+plt.ylabel('projected y-coordinate ($10^3$ km)')
+plt.title('Jakobshavn Isbrae Line Profile')
+plt.legend();
+
+# remove sparse data
+sparse_data = [5, 7, 10, 15, 22, 25, 29, 30, 35, 39, 56, 57, 60, 62, 68, 71, 75, 76, 78, 80, 82, 84]
+t_sample = np.delete(ice_t, sparse_data) # remove sparse data from time sample
+z_sample = np.delete(zts, sparse_data, axis=0) # remove sparse data from elevation sample
+
+# convert days since 1990-01-01 to dates
+dates = pd.to_datetime(t_sample, unit='D', origin='1990-01-01')
+
+flotation = -c*np.array(bs)
+
+def remove_icebergs(elevation, flotation):
+
+    # find point where z_sample[0] crosses flotation
+    crossing = np.argmax(elevation > flotation)
+    no_icebergs = [bs[i] if i<crossing else elevation[i] for i in range(len(elevation))]
+
+    return no_icebergs
+
+# remove nans
+ds = ds0[cutoff1:cutoff2][:-2]/1000
+bedrock = -np.array(bs[:-2])
+flotation_nonan = flotation[:-2]
+h_init = remove_icebergs(z_sample[0][:-2], flotation_nonan)
+h_final = remove_icebergs(z_sample[n][:-2], flotation_nonan)
+
+# SET UP
+
+g = 9.81
+nu = 5e18/917 # 1e18 does not diffuse quite far enough
+D0 = g / (3*nu)
+dt = 50000.
+T = (dates[n] - dates[0]).total_seconds()
+a0 = 3.74356 / (365.25*24*60*60) # snowfall in m/s
+
+L = (ds[-1] - ds[0]) # length of ice sheet considered
+nx = 500 # number of cells
+dx = L/nx # cell size
+
+mesh = Grid1D(nx=nx, dx=L/nx) # create mesh
+mesh += ds[0] # shift mesh to start at d = 6km
+xs = mesh.cellCenters[0] # x-coordinates of cell centers
+Xs = mesh.faceCenters[0] # x-coordinates of faces
+
+# make bedrock
+b = CellVariable(name="bedrock", mesh=mesh, value=np.interp(xs, ds, bedrock))
+
+# make ice
+h = CellVariable(name="ice", mesh=mesh, value=np.interp(xs, ds, h_init))
+
+# make final ice position
+h_final = CellVariable(name="ice final", mesh=mesh, value=np.interp(xs, ds, h_final))
+
+# plt.plot(xs, h.value, label='interpolated initial ice')
+# plt.plot(ds, h_init, label='initial ice')
+# plt.plot(xs, c*b.value, label='interpolated flotation')
+# plt.plot(ds, flotation_nonan, label='flotation')
+# plt.ylim([0,380])
+# plt.legend()
+
+viewer = Viewer(vars=(h, h_final, -b) , datamin=-1500, datamax=400, FIPY_VIEWER='matplotlib')
+viewer.axes.legend_._loc_real = 0 # move legend to bottom left
+
+for t in np.arange(0, T/dt, 1):
+
+    # find index of xG via linear interpolation
+    crossing = np.argmax(h.value > c*b.value)
+
+    # parameters need for linear interpolation
+    mh = (h.value[crossing] - h.value[crossing-1])/dx
+    mb = (b.value[crossing] - b.value[crossing-1])/dx
+    ch = h.value[crossing] - mh*xs[crossing]
+    cb = b.value[crossing] - mb*xs[crossing]
+
+    # find xG
+    xG = (cb - ch)/(mh - mb)
+
+    # make new mesh with xG at a face
+    mesh_prime = mesh + xG - Xs.value[crossing]
+
+    # make new ice and bedrock variables
+    h_prime = CellVariable(name="ice prime", mesh=mesh_prime, value=h.value)
+    b_prime = CellVariable(name="bedrock prime", mesh=mesh_prime, value=b.value)
+    viewer_prime = Viewer(vars=(h_prime, -b_prime), datamin=-1500, datamax=400, FIPY_VIEWER='matplotlib')
+
+    # cut ice below critical height
+    h_prime.setValue(-b_prime.value, where=(h_prime.value<c*b_prime.value))
+
+    # setup equation in this frame
+    eq_prime = TransientTerm() == DiffusionTerm(coeff=(D0/dt)*(h_prime+b_prime)**3) + (a0/dt)
+    h_prime.faceGrad.constrain([0], where=mesh.facesLeft)
+
+    # evolve the ice sheet by one time step
+    eq_prime.solve(var=h_prime, dt=dt, solver=solver)
+
+    # shift back into original reference
+    h.setValue(h_prime.value)
+
+    print(f'{100*dt*t/T}% complete')
+    
+    viewer.plot()
